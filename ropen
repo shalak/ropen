@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+This script identifies the SMB share corresponding to a given filesystem path and
+sends the resulting `smb://` URL to a specified SSH client via TCP.
+
+Key Features:
+- Parses `/etc/samba/smb.conf` to load SMB share definitions
+- Resolves fully-qualified domain name of the host
+- Computes the relative path of a file under a matching share
+- Sends the `smb://hostname/share/path` to a client via TCP
+
+Usage:
+    python3 script.py [TARGET_PATH]
+    If no path is given, the current working directory is used.
+
+Environment:
+    SSH_CLIENT (str): Hostname or IP of the client to send the URL to.
+    SSH_CLIENT_PORT (int): Port on the client to send the data to.
+"""
+
+import os
+import sys
+import socket
+from pathlib import Path
+from configparser import ConfigParser
+from typing import Generator, Tuple, Optional, Dict
+
+# === Config ===
+SSH_CLIENT = "localhost"
+SSH_CLIENT_PORT = 5555
+SMB_CONF = "/etc/samba/smb.conf"
+
+def resolve_fqdn(hostname: str) -> str:
+    """
+    Resolve the fully-qualified domain name (FQDN) of a given hostname.
+
+    Args:
+        hostname (str): The hostname to resolve.
+
+    Returns:
+        str: The FQDN.
+    """
+    return hostname if '.' in hostname else socket.getfqdn(hostname)
+
+def preprocess_smb_conf(file_path: str) -> Generator[str, None, None]:
+    """
+    Strip comments and blank lines from an smb.conf file.
+
+    Args:
+        file_path (str): Path to the smb.conf file.
+
+    Yields:
+        str: Preprocessed configuration lines.
+    """
+    with open(file_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(('#', ';')):
+                continue
+            line = line.split('#', 1)[0].split(';', 1)[0].strip()
+            yield line
+
+def load_smb_shares(conf_path: str) -> Dict[Path, str]:
+    """
+    Parse the smb.conf file and extract share definitions.
+
+    Args:
+        conf_path (str): Path to smb.conf
+
+    Returns:
+        dict[Path, str]: Mapping of resolved share paths to share names.
+
+    Example:
+        If smb.conf contains:
+            [myshare]
+            path = /srv/samba/myshare
+
+        Result:
+            {
+                Path("/srv/samba/myshare"): "myshare"
+            }
+    """
+    parser = ConfigParser(strict=False, interpolation=None, allow_no_value=True)
+    parser.optionxform = str
+    parser.read_string('\n'.join(preprocess_smb_conf(conf_path)))
+
+    shares: Dict[Path, str] = {}
+    for section in parser.sections():
+        if section.lower() == "global":
+            continue
+        path = parser.get(section, "path", fallback=None)
+        if path:
+            shares[Path(path).resolve()] = section
+    return shares
+
+def find_share(target_path: Path, shares: Dict[Path, str]) -> Tuple[Optional[str], Optional[Path]]:
+    """
+    Find the matching SMB share for a given filesystem path.
+
+    Args:
+        target_path (Path): The path to map.
+        shares (dict[Path, str]): Mapping of share base paths to share names.
+
+    Returns:
+        tuple[str | None, Path | None]: (share name, relative path)
+
+    Example:
+        shares = { Path("/srv/samba/myshare"): "myshare" }
+        target = Path("/srv/samba/myshare/docs/readme.txt")
+        => ("myshare", Path("docs/readme.txt"))
+    """
+    for base_path, share in shares.items():
+        try:
+            rel_path = target_path.relative_to(base_path)
+            return share, rel_path
+        except ValueError:
+            continue
+    return None, None
+
+def send_to_ssh_client(smb_url: str) -> None:
+    """
+    Send the SMB URL to the SSH client via TCP.
+
+    Args:
+        smb_url (str): The URL to send, e.g., smb://host/share/path
+    """
+    with socket.create_connection((SSH_CLIENT, SSH_CLIENT_PORT), timeout=2) as s:
+        s.sendall(smb_url.encode("utf-8"))
+
+def main() -> None:
+    """
+    Main entry point. Determines target path, computes SMB URL,
+    and sends it to SSH client.
+    """
+    if len(sys.argv) > 1:
+        target = Path(os.path.abspath(os.path.expanduser(sys.argv[1]))).resolve()
+    else:
+        target = Path.cwd().resolve()
+
+    shares = load_smb_shares(SMB_CONF)
+
+    share, rel_path = find_share(target, shares)
+    if not share:
+        print(f"No matching SMB share for: {target}")
+        return
+
+    hostname = resolve_fqdn(os.uname().nodename)
+    smb_path = Path(f"/{share}") / rel_path
+    smb_url = f"smb://{hostname}{smb_path}"
+
+    print(f"Sending to SSH_CLIENT: {smb_url}")
+    send_to_ssh_client(smb_url)
+
+if __name__ == "__main__":
+    main()
